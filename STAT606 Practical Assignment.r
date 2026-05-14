@@ -1,19 +1,23 @@
+
 #-----------------------------------------------------------------------------------------#
 # STAT606 Practical Assignment
 # Predict whether machine downtime requires maintenance
 #-----------------------------------------------------------------------------------------#
 
 # Load libraries required for data manipulation, modelling and evaluation
-library(dplyr)
-library(caTools)
-library(caret)
-library(pROC)
+library(dplyr) # for data manipulation and preprocessing
+library(caTools) # for splitting into train and test sets
+library(caret) # used for performance metric functions
+library(pROC) # used for obtaining AUC
 library(h2o)
-library(rpart)
-library(rpart.plot)
 library(readr)
 
-options(scipen = 999)
+# For plot Decision
+library(rpart)
+library(rpart.plot)
+
+# this is to turn scientific notation off so the output is easier to interpret:
+options(scipen = 999) 
 
 #-------------------------------------------------------------------------------------------#
 # Setup parameters for reproducibility and model evaluation
@@ -32,11 +36,15 @@ threshold <- 0.5
 #-------------------------------------------------------------------------------------------#
 # Load dataset from local directory (raw EMEA downtime operational data)
 
-iportal_downtimes_emea <- read_csv("C:/Users/mambaza/Desktop/UKZN PGDP Data Science/Study stuff/Semester 1/STAT606WA1  Applied Binary Classification and Matching/Group Assignment/Assignment files/iportal downtimes emea.csv")
+library(readr)
+iportal_downtimes_emea <- read_csv("My practice scripts/STAT606-Machine-Learning-Assignment/iportal downtimes emea.csv")
+
+View(iportal_downtimes_emea)
 
 df <- data.frame(iportal_downtimes_emea)
 
 # Initial data understanding to inspect structure, data types and distributions
+df$TimestampTime <- as.character(df$TimestampTime)
 summary(df)
 str(df)
 
@@ -46,15 +54,15 @@ str(df)
 # Missing downtime types are replaced with "Unknown" so model can still learn from them
 df$DowntimeType[is.na(df$DowntimeType)] <- "Unknown"
 
+
 # We define a threshold based on the 75th percentile of downtime duration
 # This helps us identify unusually long downtime events
-
 duration_threshold <- quantile(df$DowntimeDuration, 0.75, na.rm = TRUE)
+
 
 # Create binary target variable:
 # 1 = maintenance required (long duration or failure-related keyword present)
 # 0 = no maintenance required
-
 df$MaintenanceRequired <- ifelse(
   df$DowntimeDuration > duration_threshold |
     grepl("technical|mechanical|electrical|failure|breakdown|fault",
@@ -62,7 +70,10 @@ df$MaintenanceRequired <- ifelse(
   1, 0
 )
 
-df$MaintenanceRequired <- factor(df$MaintenanceRequired)
+
+# Force the target to be a factor with a fixed class order (0 = no maintenance, 1 = maintenance)
+# This ensures predicted probabilities (p0/p1) and ROC/AUC are interpreted correctly
+df$MaintenanceRequired <- factor(df$MaintenanceRequired, levels = c(0,1), labels = c("0","1"))
 
 # Check class balance to ensure both classes exist
 table(df$MaintenanceRequired)
@@ -76,6 +87,15 @@ if(length(unique(df$MaintenanceRequired)) < 2){
 # Remove duplicate records to prevent bias in model learning
 df <- unique(df)
 
+# Remove leakage variable used in target construction
+df <- df %>% select(-DowntimeType)
+
+
+
+# Converting FaultDuration to numeric before computing the median
+df$FaultDuration <- as.numeric(as.character(df$FaultDuration))
+
+#------------------------------------------------------------------------------------------#
 # Handle missing numeric values using median (robust to outliers)
 df$FaultDuration[is.na(df$FaultDuration)] <- median(df$FaultDuration, na.rm = TRUE)
 
@@ -84,22 +104,10 @@ df$Area[is.na(df$Area)] <- "Unknown"
 df$Department[is.na(df$Department)] <- "Unknown"
 
 # Remove identifier columns that do not contribute to prediction
-df <- df %>% select(-DowntimeId, -MessageId)
+df <- df %>% select(-DowntimeId, -MessageId, -Reason, -MessageText)
 
-# Remove leakage columns that could directly reveal the target outcome
-df <- df %>% select(-Reason, -MessageText)
-
-#-----------------------------------------------------------------------------------------#
-# Basic dataset characteristics after cleaning
-
-# We check dataset shape, structure and target distribution
-dim(df)
-summary(df)
-table(df$MaintenanceRequired)
-
-#-----------------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------------------#
 # Feature engineering to improve model predictive capability
-
 # Convert timestamp into datetime format for feature extraction
 df$DowntimeStartDatetime <- as.POSIXct(df$DowntimeStartDatetime)
 
@@ -119,6 +127,7 @@ df$EmergencyFlag <- ifelse(
 # Convert all character variables into factors for modelling compatibility
 df <- df %>% mutate(across(where(is.character), as.factor))
 
+# Define target variable
 target <- "MaintenanceRequired"
 
 #----------------------------------------------------------------------------------------#
@@ -169,6 +178,9 @@ test_set[sapply(test_set, is.infinite)] <- NA
 
 training_set[] <- lapply(training_set, function(x) ifelse(is.nan(x), NA, x))
 test_set[] <- lapply(test_set, function(x) ifelse(is.nan(x), NA, x))
+#---------------------------------------------------------------------------------------#
+
+# Fix missing values before training H2O models
 
 num_cols <- sapply(training_set, is.numeric)
 
@@ -185,9 +197,7 @@ for (col in names(training_set)[cat_cols]) {
   test_set[[col]][is.na(test_set[[col]])] <- "Unknown"
 }
 
-#---------------------------------------------------------------------------------------#
 # Define predictor variables for modelling
-
 predictors <- setdiff(names(training_set), target)
 
 #---------------------------------------------------------------------------------------#
@@ -201,6 +211,9 @@ test_h2o <- as.h2o(test_set)
 train_h2o[[target]] <- as.factor(train_h2o[[target]])
 test_h2o[[target]] <- as.factor(test_h2o[[target]])
 
+# Numeric response for ROC analysis
+y_test_numeric <- as.numeric(as.character(test_set[[target]]))
+
 #---------------------------------------------------------------------------------------#
 # 1. Decision Tree model (implemented using single-tree Random Forest for stability)
 
@@ -208,19 +221,16 @@ DT <- h2o.randomForest(
   x = predictors,
   y = target,
   training_frame = train_h2o,
-  ntrees = 1,
+  ntrees = 8,
   max_depth = 5,
   min_rows = 10,
   seed = seed
 )
 
 preds_DT <- as.data.frame(h2o.predict(DT, test_h2o))
+prob_col_DT <- if ("p1" %in% names(preds_DT)) "p1" else names(preds_DT)[ncol(preds_DT)]
 
-test_DT_pred <- cbind(test_set,
-                      pred_prob = as.numeric(preds_DT[,3]))
-
-roc_dt_test <- roc(as.numeric(as.character(test_DT_pred[[target]])),
-                   test_DT_pred$pred_prob)
+roc_dt_test <- roc(y_test_numeric, as.numeric(preds_DT[[prob_col_DT]]))
 
 #---------------------------------------------------------------------------------------#
 # 2. Logistic Regression model (captures linear relationships in downtime behaviour)
@@ -235,36 +245,12 @@ LR <- h2o.glm(
 )
 
 preds_LR <- as.data.frame(h2o.predict(LR, test_h2o))
+prob_col_LR <- if ("p1" %in% names(preds_LR)) "p1" else names(preds_LR)[ncol(preds_LR)]
 
-test_LR_pred <- cbind(test_set,
-                      pred_prob = as.numeric(preds_LR[,3]))
-
-roc_LR_test <- roc(as.numeric(as.character(test_LR_pred[[target]])),
-                   test_LR_pred$pred_prob)
+roc_LR_test <- roc(y_test_numeric, as.numeric(preds_LR[[prob_col_LR]]))
 
 #---------------------------------------------------------------------------------------#
-# 3. Random Forest model (captures complex non-linear relationships)
-
-RF <- h2o.randomForest(
-  x = predictors,
-  y = target,
-  training_frame = train_h2o,
-  ntrees = 100,
-  max_depth = 20,
-  nfolds = folds,
-  seed = seed
-)
-
-preds_RF <- as.data.frame(h2o.predict(RF, test_h2o))
-
-test_RF_pred <- cbind(test_set,
-                      pred_prob = as.numeric(preds_RF[,3]))
-
-roc_RF_test <- roc(as.numeric(as.character(test_RF_pred[[target]])),
-                   test_RF_pred$pred_prob)
-
-#---------------------------------------------------------------------------------------#
-# 4. Naive Bayes model (assumes conditional independence of predictors)
+# 3. Naive Bayes model (assumes conditional independence of predictors)
 
 nb <- h2o.naiveBayes(
   x = predictors,
@@ -275,22 +261,20 @@ nb <- h2o.naiveBayes(
 )
 
 preds_nb <- as.data.frame(h2o.predict(nb, test_h2o))
+prob_col_nb <- if ("p1" %in% names(preds_nb)) "p1" else names(preds_nb)[ncol(preds_nb)]
 
-test_nb_pred <- cbind(test_set,
-                      pred_prob = as.numeric(preds_nb[,3]))
-
-roc_nb_test <- roc(test_nb_pred[[target]],
-                   test_nb_pred$pred_prob)
+roc_nb_test <- roc(y_test_numeric, as.numeric(preds_nb[[prob_col_nb]]))
 
 #---------------------------------------------------------------------------------------#
 # Model performance comparison using AUC (best model selection)
 
 model_results <- data.frame(
-  Model = c("Decision Tree","Logistic Regression","Random Forest","Naive Bayes"),
-  AUC = c(auc(roc_dt_test),
-          auc(roc_LR_test),
-          auc(roc_RF_test),
-          auc(roc_nb_test))
+  Model = c("Decision Tree","Logistic Regression","Naive Bayes"),
+  AUC = c(
+    auc(roc_dt_test),
+    auc(roc_LR_test),
+    auc(roc_nb_test)
+  )
 )
 
 print(model_results)
@@ -303,23 +287,18 @@ print(best_model)
 
 plot(roc_dt_test, col="red", lwd=2)
 lines(roc_LR_test, col="green", lwd=2)
-lines(roc_RF_test, col="purple", lwd=2)
 lines(roc_nb_test, col="blue", lwd=2)
 
 legend("bottomright",
-       legend=c("Decision Tree","Logistic Regression","Random Forest","Naive Bayes"),
-       col=c("red","green","purple","blue"),
+       legend=c("Decision Tree","Logistic Regression","Naive Bayes"),
+       col=c("red","green","blue"),
        lwd=2)
 
 #---------------------------------------------------------------------------------------#
 # Feature importance based on best performing model
 
-if(best_model == "Random Forest") {
-  
-  var_imp <- h2o.varimp(RF)
-  print(head(var_imp, 5))
-  
-} else if(best_model == "Decision Tree") {
+
+if(best_model == "Decision Tree") {
   
   var_imp <- h2o.varimp(DT)
   print(head(var_imp, 5))
@@ -329,10 +308,12 @@ if(best_model == "Random Forest") {
   var_imp <- h2o.varimp(LR)
   print(head(var_imp, 5))
   
-} else {
+}else if(best_model == "Naive Bayes") {
   
   print("Naive Bayes does not provide stable feature importance")
+  
 }
+
 
 #---------------------------------------------------------------------------------------#
 # Shutdown H2O cluster after modelling
